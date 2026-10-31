@@ -1,0 +1,150 @@
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -36,6 +36,7 @@
+ static bool enable_autosuspend = IS_ENABLED(CONFIG_BT_HCIBTUSB_AUTOSUSPEND);
+ static bool enable_poll_sync = IS_ENABLED(CONFIG_BT_HCIBTUSB_POLL_SYNC);
+ static bool reset = true;
++static bool barrot_legacy_le = true;
+ 
+ static struct usb_driver btusb_driver;
+ 
+@@ -1045,6 +1046,8 @@
+ 	int suspend_count;
+ 	const struct usb_device_id *match_id;
+ 
++	__le16 barrot_feat_handle;
++
+ 	int (*recv_event)(struct hci_dev *hdev, struct sk_buff *skb);
+ 	int (*recv_acl)(struct hci_dev *hdev, struct sk_buff *skb);
+ 	int (*recv_bulk)(struct btusb_data *data, void *buffer, int count);
+@@ -2290,6 +2293,15 @@
+ 
+ 	switch (hci_skb_pkt_type(skb)) {
+ 	case HCI_COMMAND_PKT:
++		/* Remember the handle for btusb_recv_event_barrot() */
++		if (skb->len >= HCI_COMMAND_HDR_SIZE + 2 &&
++		    get_unaligned_le16(skb->data) == HCI_OP_LE_READ_REMOTE_FEATURES) {
++			struct btusb_data *data = hci_get_drvdata(hdev);
++
++			data->barrot_feat_handle =
++				cpu_to_le16(get_unaligned_le16(skb->data + HCI_COMMAND_HDR_SIZE));
++		}
++
+ 		urb = alloc_ctrl_urb(hdev, skb);
+ 		if (IS_ERR(urb))
+ 			return PTR_ERR(urb);
+@@ -2843,6 +2855,80 @@
+ 	return hci_recv_frame(hdev, skb);
+ }
+ 
++/* Right after an LE connection the controller answers LE Read Remote Used
++ * Features with Controller Busy, and the core drops the connection. Turn
++ * the error into success and complete the procedure with no features.
++ */
++static int btusb_barrot_fake_remote_features(struct hci_dev *hdev,
++					     struct sk_buff *skb)
++{
++	struct btusb_data *data = hci_get_drvdata(hdev);
++	struct hci_ev_cmd_status *cs;
++	struct hci_ev_le_remote_feat_complete *ev;
++	struct sk_buff *nskb;
++	int err;
++
++	cs = (void *)(skb->data + HCI_EVENT_HDR_SIZE);
++	bt_dev_warn(hdev, "Barrot: remote features status 0x%2.2x, faking completion",
++		    cs->status);
++	cs->status = 0x00;
++
++	nskb = bt_skb_alloc(HCI_EVENT_HDR_SIZE + 1 + sizeof(*ev), GFP_ATOMIC);
++	if (!nskb)
++		return hci_recv_frame(hdev, skb);
++
++	hci_skb_pkt_type(nskb) = HCI_EVENT_PKT;
++	skb_put_u8(nskb, HCI_EV_LE_META);
++	skb_put_u8(nskb, 1 + sizeof(*ev));
++	skb_put_u8(nskb, HCI_EV_LE_REMOTE_FEAT_COMPLETE);
++	ev = skb_put_zero(nskb, sizeof(*ev));
++	ev->handle = data->barrot_feat_handle;
++
++	err = hci_recv_frame(hdev, skb);
++	if (err) {
++		kfree_skb(nskb);
++		return err;
++	}
++
++	return hci_recv_frame(hdev, nskb);
++}
++
++static int btusb_recv_event_barrot(struct hci_dev *hdev, struct sk_buff *skb)
++{
++	struct hci_ev_cmd_complete *cc;
++	struct hci_ev_cmd_status *cs;
++	struct hci_rp_le_read_local_features *rp;
++
++	if (barrot_legacy_le &&
++	    skb->len >= HCI_EVENT_HDR_SIZE + sizeof(*cs) &&
++	    skb->data[0] == HCI_EV_CMD_STATUS) {
++		cs = (void *)(skb->data + HCI_EVENT_HDR_SIZE);
++
++		if (__le16_to_cpu(cs->opcode) == HCI_OP_LE_READ_REMOTE_FEATURES &&
++		    cs->status == 0x3a)	/* Controller Busy */
++			return btusb_barrot_fake_remote_features(hdev, skb);
++	}
++
++	/* Hide LE extended advertising: once an extended command has been
++	 * sent the controller answers the legacy scan commands with
++	 * Command Disallowed, and the extended scan ones hang it.
++	 */
++	if (barrot_legacy_le &&
++	    skb->len >= HCI_EVENT_HDR_SIZE + sizeof(*cc) + sizeof(*rp) &&
++	    skb->data[0] == HCI_EV_CMD_COMPLETE) {
++		cc = (void *)(skb->data + HCI_EVENT_HDR_SIZE);
++		rp = (void *)(skb->data + HCI_EVENT_HDR_SIZE + sizeof(*cc));
++
++		if (__le16_to_cpu(cc->opcode) == HCI_OP_LE_READ_LOCAL_FEATURES &&
++		    !rp->status && rp->features[1] & HCI_LE_EXT_ADV) {
++			bt_dev_info(hdev, "Barrot: hiding LE extended advertising");
++			rp->features[1] &= ~HCI_LE_EXT_ADV;
++		}
++	}
++
++	return hci_recv_frame(hdev, skb);
++}
++
+ static void btusb_mtk_claim_iso_intf(struct btusb_data *data)
+ {
+ 	struct btmtk_data *btmtk_data;
+@@ -4259,6 +4345,8 @@
+ 		priv_size += sizeof(struct btrealtek_data);
+ 
+ 		data->recv_event = btusb_recv_event_realtek;
++	} else if (id->driver_info & BTUSB_BARROT) {
++		data->recv_event = btusb_recv_event_barrot;
+ 	} else if (id->driver_info & BTUSB_MEDIATEK) {
+ 		/* Allocate extra space for Mediatek device */
+ 		priv_size += sizeof(struct btmtk_data);
+@@ -4451,6 +4539,14 @@
+ 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_WRITE_AUTH_PAYLOAD_TIMEOUT);
+ 	}
+ 
++	if (id->driver_info & BTUSB_BARROT && barrot_legacy_le) {
++		/* LE extended scan/connect is advertised, but the controller
++		 * stops responding to it (0x2041 tx timeout, then USB reset).
++		 */
++		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_EXT_SCAN);
++		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_EXT_CREATE_CONN);
++	}
++
+ 	if (!reset)
+ 		hci_set_quirk(hdev, HCI_QUIRK_RESET_ON_CLOSE);
+ 
+@@ -4836,6 +4932,9 @@
+ module_param(reset, bool, 0644);
+ MODULE_PARM_DESC(reset, "Send HCI reset command on initialization");
+ 
++module_param(barrot_legacy_le, bool, 0644);
++MODULE_PARM_DESC(barrot_legacy_le, "Use legacy LE scan/connect on Barrot controllers");
++
+ MODULE_AUTHOR("Marcel Holtmann <marcel@holtmann.org>");
+ MODULE_DESCRIPTION("Generic Bluetooth USB driver ver " VERSION);
+ MODULE_VERSION(VERSION);
