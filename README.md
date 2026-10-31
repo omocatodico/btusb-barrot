@@ -76,7 +76,7 @@ sudo apt install dkms linux-headers-$(uname -r) build-essential clang lld curl p
 ## Install
 
 ```sh
-git clone https://github.com/<your-user>/btusb-barrot.git
+git clone https://github.com/omocatodico/btusb-barrot.git
 cd btusb-barrot
 
 # Optional: try it first, until the next reboot only
