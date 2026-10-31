@@ -145,8 +145,9 @@ needed: remove it with `sudo ./install.sh --remove`.
 
 **Distribution maintainers:** rather than shipping this DKMS package, you can
 apply that series to your kernel. It is what will end up upstream, and it
-was tested on 7.2.11 with the same hardware. (Patch 2 needs a small context
-adjustment on 7.2.x, see the cover letter.)
+was tested on 7.2.11 with the same hardware. A ready-to-apply backport for
+v7.2.x is in [`kernel-patches/v7.2/`](kernel-patches/v7.2/), see
+[`kernel-patches/README.md`](kernel-patches/README.md).
 
 ## Tested with
 

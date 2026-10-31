@@ -1,0 +1,63 @@
+From 149097a9dfef01ec36e252cb59b20c7ddb7c3254 Mon Sep 17 00:00:00 2001
+From: Ernesto Salvetti <ernesto.salvetti@tambosi.tn.it>
+Date: Sat, 31 Oct 2026 12:59:12 +0100
+Subject: [PATCH 3/3] Bluetooth: btusb: Disable broken LE extended scan on
+ Barrot controllers
+
+The Barrot controller in the UGREEN Bluetooth 5.4 dongle (33fa:0010)
+reports support for LE Set Extended Scan Parameters/Enable and LE
+Extended Create Connection, but stops answering commands as soon as
+extended scanning is used. btusb then resets the device, it
+re-enumerates and the same thing happens again, in a loop every ~4
+seconds whenever a scan is started (e.g. to connect to an LE device):
+
+  Bluetooth: hci0: Opcode 0x2041 failed: -110
+  Bluetooth: hci0: command 0x2041 tx timeout
+  usb 9-7: USB disconnect, device number 13
+  usb 9-7: new full-speed USB device number 14 using xhci_hcd
+
+Set HCI_QUIRK_BROKEN_EXT_SCAN and HCI_QUIRK_BROKEN_EXT_CREATE_CONN so
+that only the legacy LE commands are used. Extended create connection
+has to go as well, since legacy and extended commands can't be mixed.
+
+This depends on the previous two patches: without them scanning fails
+with Command Disallowed and LE connections are dropped right after
+they are established.
+
+Tested with 33fa:0010 (bcdDevice 88.91) and an Xbox Wireless
+Controller: scanning, LE Secure Connections pairing and HID input work.
+33fa:0012 shares the BTUSB_BARROT flag but was not tested.
+
+Assisted-by: LLM
+Signed-off-by: Ernesto Salvetti <ernesto.salvetti@tambosi.tn.it>
+---
+
+Notes:
+    Backport to v7.2.x of the series submitted to linux-bluetooth:
+    https://lore.kernel.org/all/20261031-barrot-le-fixes-v1-v1-0-30e2089882bf@tambosi.tn.it/
+    drivers/bluetooth/btusb_main.c is still btusb.c in v7.2.x; otherwise
+    unchanged.
+
+ drivers/bluetooth/btusb.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index bf9a93d5c..b84fa11fd 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -4451,6 +4451,12 @@ static int btusb_probe(struct usb_interface *intf,
+ 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_WRITE_AUTH_PAYLOAD_TIMEOUT);
+ 	}
+ 
++	if (id->driver_info & BTUSB_BARROT) {
++		/* Support is advertised, but the controller hangs on it */
++		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_EXT_SCAN);
++		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_EXT_CREATE_CONN);
++	}
++
+ 	if (!reset)
+ 		hci_set_quirk(hdev, HCI_QUIRK_RESET_ON_CLOSE);
+ 
+-- 
+2.53.0.697.g625c4fb2daa
+

@@ -1,0 +1,96 @@
+From b8c9eaf61b4f106ec82bfb6a5d8f48f042cf99c3 Mon Sep 17 00:00:00 2001
+From: Ernesto Salvetti <ernesto.salvetti@tambosi.tn.it>
+Date: Sat, 31 Oct 2026 12:59:12 +0100
+Subject: [PATCH 2/3] Bluetooth: hci_event: Don't drop LE link on busy remote
+ features read
+
+Right after an outgoing LE connection is established, the Barrot
+controller in the UGREEN Bluetooth 5.4 dongle (33fa:0010) rejects
+LE Read Remote Used Features with Controller Busy. The error is passed
+to hci_connect_cfm(), the pairing attempt fails and the link is torn
+down right away, so no LE device can be paired or connected:
+
+  > HCI Event: LE Meta Event (0x3e) plen 19
+        LE Connection Complete (0x01)
+          Status: Success (0x00)
+          Handle: 65
+          Role: Central (0x00)
+  < HCI Command: LE Read Remote Used Features (0x08|0x0016) plen 2
+          Handle: 65
+  > HCI Event: Command Status (0x0f) plen 4
+        LE Read Remote Used Features (0x08|0x0016) ncmd 1
+          Status: Controller Busy (0x3a)
+  @ MGMT Event: Command Complete (0x0001) plen 10
+        Pair Device (0x0019) plen 7
+          Status: Busy (0x0a)
+  < HCI Command: Disconnect (0x01|0x0006) plen 3
+          Reason: Remote User Terminated Connection (0x13)
+
+The controller does not send an LE Read Remote Features Complete event
+later on either.
+
+The remote features are not needed to use the connection; the stack
+already continues without them when a peripheral gets Unsupported
+Remote Feature. Do the same for Controller Busy and move the connection
+to the connected state.
+
+With this an Xbox Wireless Controller pairs over LE Secure Connections
+and works as HID device.
+
+Assisted-by: LLM
+Signed-off-by: Ernesto Salvetti <ernesto.salvetti@tambosi.tn.it>
+---
+
+Notes:
+    Backport to v7.2.x of the series submitted to linux-bluetooth:
+    https://lore.kernel.org/all/20261031-barrot-le-fixes-v1-v1-0-30e2089882bf@tambosi.tn.it/
+    Context adjusted: hci_cs_le_read_remote_features() in v7.2.x lacks the
+    HCI_ERROR_UNSUPPORTED_REMOTE_FEATURE handling found in bluetooth-next, so
+    the Controller Busy check is placed inside the BT_CONFIG branch directly.
+    Same behaviour.
+
+ include/net/bluetooth/hci.h |  1 +
+ net/bluetooth/hci_event.c   | 14 +++++++++++++-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/bluetooth/hci.h b/include/net/bluetooth/hci.h
+index 0138e3bc4..b1fe75fc1 100644
+--- a/include/net/bluetooth/hci.h
++++ b/include/net/bluetooth/hci.h
+@@ -721,6 +721,7 @@ enum {
+ #define HCI_ERROR_UNSUPPORTED_REMOTE_FEATURE	0x1a
+ #define HCI_ERROR_INVALID_LL_PARAMS	0x1e
+ #define HCI_ERROR_UNSPECIFIED		0x1f
++#define HCI_ERROR_CONTROLLER_BUSY	0x3a
+ #define HCI_ERROR_ADVERTISING_TIMEOUT	0x3c
+ #define HCI_ERROR_CANCELLED_BY_HOST	0x44
+ 
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index f502be73d..42c75529e 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -2921,8 +2921,20 @@ static void hci_cs_le_read_remote_features(struct hci_dev *hdev, u8 status)
+ 	hci_dev_lock(hdev);
+ 
+ 	conn = hci_conn_hash_lookup_handle(hdev, __le16_to_cpu(cp->handle));
+-	if (conn && conn->state == BT_CONFIG)
++	if (conn && conn->state == BT_CONFIG) {
++		/* Some controllers reject the command with Controller Busy
++		 * right after the connection has been established. The
++		 * remote features are not required to use the connection,
++		 * so continue without them instead of dropping it.
++		 */
++		if (status == HCI_ERROR_CONTROLLER_BUSY) {
++			bt_dev_warn(hdev, "Remote features busy, continuing without them");
++			conn->state = BT_CONNECTED;
++			status = 0x00;
++		}
++
+ 		hci_connect_cfm(conn, status);
++	}
+ 
+ 	hci_dev_unlock(hdev);
+ }
+-- 
+2.53.0.697.g625c4fb2daa
+
